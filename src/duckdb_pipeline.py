@@ -129,12 +129,40 @@ def _candidate_table(con, source1="s1", target="target", out="candidates"):
               FROM {side}_addr_toks_raw
               WHERE length(token) >= 5 AND token NOT IN ('st','rd','ave','blvd','ln','dr','apt','ste','hwy','near','opp','opposite','floor','plot','flat','shop','no','block','road','street','avenue','lane','drive','delhi','mumbai','kolkata','chennai','bangalore','hyderabad','pune','city','state','india','us','district','nagar','extn','colony')
             ) t ON t.entity_id = n.entity_id AND t.country_norm = n.country_norm AND t.rn = 1
+        # Rule 6: Address Numeric (3+ digits) and 2-Token Alphabetic (4+ chars) Staging
+        con.execute(f"""
+            CREATE OR REPLACE TABLE {side}_addr_num_3plus AS
+            SELECT DISTINCT entity_id, country_norm, ltrim(num, '0') as clean_num
+            FROM (
+              SELECT entity_id, country_norm, unnest(regexp_extract_all(address_norm, '[0-9]{{3,8}}')) as num
+              FROM {src}
+              WHERE address_norm <> ''
+            )
+            WHERE ltrim(num, '0') <> ''
+        """)
+        con.execute(f"""
+            CREATE OR REPLACE TABLE {side}_addr_2tok_pairs AS
+            SELECT a.entity_id, a.country_norm, a.token as tok1, b.token as tok2
+            FROM (
+              SELECT DISTINCT entity_id, country_norm, token
+              FROM {side}_addr_toks_raw
+              WHERE length(token) >= 4 AND regexp_matches(token, '^[a-z]+$')
+                AND token NOT IN ('street','road','avenue','lane','drive','apartment','suite','highway','roadway','near','opp','opposite','floor','plot','flat','shop','block','delhi','mumbai','kolkata','chennai','bangalore','hyderabad','pune','city','state','india','us','district','nagar','extn','colony')
+            ) a
+            JOIN (
+              SELECT DISTINCT entity_id, country_norm, token
+              FROM {side}_addr_toks_raw
+              WHERE length(token) >= 4 AND regexp_matches(token, '^[a-z]+$')
+                AND token NOT IN ('street','road','avenue','lane','drive','apartment','suite','highway','roadway','near','opp','opposite','floor','plot','flat','shop','block','delhi','mumbai','kolkata','chennai','bangalore','hyderabad','pune','city','state','india','us','district','nagar','extn','colony')
+            ) b ON a.entity_id = b.entity_id AND a.country_norm = b.country_norm AND a.token < b.token
         """)
 
     # Target frequency tables for the 3 validated rules
     con.execute("CREATE OR REPLACE TABLE r_fname_tok2_num AS SELECT country_norm, name_tok2, clean_num, count(*) n FROM r_name_tok2_num GROUP BY 1, 2, 3")
     con.execute("CREATE OR REPLACE TABLE r_ffold_p4_num AS SELECT country_norm, fold_p4, clean_num, count(*) n FROM r_name_folded GROUP BY 1, 2, 3")
     con.execute("CREATE OR REPLACE TABLE r_fmulti_num_tok AS SELECT country_norm, clean_num, addr_tok1, count(*) n FROM r_multi_num_tok GROUP BY 1, 2, 3")
+    con.execute("CREATE OR REPLACE TABLE r_faddr_num_3plus AS SELECT country_norm, clean_num, count(*) n FROM r_addr_num_3plus GROUP BY 1, 2")
+    con.execute("CREATE OR REPLACE TABLE r_faddr_2tok AS SELECT country_norm, tok1, tok2, count(*) n FROM r_addr_2tok_pairs GROUP BY 1, 2, 3")
 
     con.execute(f"""CREATE OR REPLACE TABLE {out} AS
       SELECT DISTINCT source1_entity_id, candidate_entity_id FROM (
@@ -258,6 +286,22 @@ def _candidate_table(con, source1="s1", target="target", out="candidates"):
         JOIN r_fmulti_num_tok f USING (country_norm, clean_num, addr_tok1)
         WHERE (tgt.name_norm IS NULL OR tgt.name_norm = '')
           AND f.n <= 50
+
+        UNION ALL
+        -- Rule 9A: Address Numeric Match (3+ digits) within Country
+        SELECT a.entity_id source1_entity_id, b.entity_id candidate_entity_id
+        FROM l_addr_num_3plus a
+        JOIN r_addr_num_3plus b USING (country_norm, clean_num)
+        JOIN r_faddr_num_3plus f USING (country_norm, clean_num)
+        WHERE f.n <= 80
+
+        UNION ALL
+        -- Rule 9B: Address 2-Token Alphabetic Match (4+ chars each) within Country
+        SELECT a.entity_id source1_entity_id, b.entity_id candidate_entity_id
+        FROM l_addr_2tok_pairs a
+        JOIN r_addr_2tok_pairs b USING (country_norm, tok1, tok2)
+        JOIN r_faddr_2tok f USING (country_norm, tok1, tok2)
+        WHERE f.n <= 50
       ) all_cands""")
     count = con.execute(f"select count(*) from {out}").fetchone()[0]
     LOG.info("Disk-backed blocking produced %s candidate pairs", count)
